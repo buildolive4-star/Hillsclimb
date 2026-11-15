@@ -56,6 +56,7 @@ fun SketchfabHangarScreen(
   onSyncAllVehicles: () -> Unit,
   onCancelBatchSync: () -> Unit,
   onClearAllCache: () -> Unit,
+  onSaveApiKey: (String) -> Unit,
   onClearError: () -> Unit,
   onBack: () -> Unit,
 ) {
@@ -65,6 +66,8 @@ fun SketchfabHangarScreen(
   var selectedSummary by remember { mutableStateOf<SketchfabModelSummary?>(null) }
   var selectedDownloadedUid by remember { mutableStateOf<String?>(null) }
   var autoRotate by remember { mutableStateOf(true) }
+  var showApiKeyDialog by remember { mutableStateOf(false) }
+  var apiKeyDraft by remember { mutableStateOf("") }
 
   LaunchedEffect(initialQuery) {
     if (sketchfabState.results.isEmpty() || initialQuery.isNotBlank()) {
@@ -164,6 +167,10 @@ fun SketchfabHangarScreen(
                 1.dp,
                 if (sketchfabState.hasValidApiKey) SuccessGreen else RacingOrangeAccent,
               ),
+            modifier =
+              Modifier.defaultMinSize(minHeight = 42.dp)
+                .clickable { showApiKeyDialog = true }
+                .testTag("sketchfab_api_key_button"),
           ) {
             Row(
               modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
@@ -172,7 +179,7 @@ fun SketchfabHangarScreen(
             ) {
               Icon(
                 imageVector = if (sketchfabState.hasValidApiKey) Icons.Filled.VerifiedUser else Icons.Filled.Key,
-                contentDescription = null,
+                contentDescription = "Configure Sketchfab API Key",
                 tint = if (sketchfabState.hasValidApiKey) SuccessGreen else GoldenYellowHighlight,
                 modifier = Modifier.size(16.dp),
               )
@@ -652,12 +659,32 @@ fun SketchfabHangarScreen(
                 border = BorderStroke(1.dp, DangerRed),
                 modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp).clickable { onClearError() },
               ) {
-                Text(
-                  text = "$err (tap to dismiss)",
-                  style = MaterialTheme.typography.labelSmall,
-                  color = TextPrimary,
+                Row(
                   modifier = Modifier.padding(8.dp),
-                )
+                  verticalAlignment = Alignment.CenterVertically,
+                  horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                  Text(
+                    text = "$err (tap to dismiss)",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextPrimary,
+                    modifier = Modifier.weight(1f),
+                  )
+                  if (!sketchfabState.hasValidApiKey || err.contains("401")) {
+                    Surface(
+                      shape = RoundedCornerShape(8.dp),
+                      color = RacingOrangeAccent,
+                      modifier = Modifier.clickable { showApiKeyDialog = true }.testTag("enter_key_inline_button"),
+                    ) {
+                      Text(
+                        text = "ENTER KEY",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = DarkNavyBg,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                      )
+                    }
+                  }
+                }
               }
             }
 
@@ -720,6 +747,55 @@ fun SketchfabHangarScreen(
           }
         }
       }
+    }
+
+    if (showApiKeyDialog) {
+      AlertDialog(
+        onDismissRequest = { showApiKeyDialog = false },
+        containerColor = CardNavy,
+        titleContentColor = TextPrimary,
+        textContentColor = TextSecondary,
+        title = { Text("Sketchfab API Token", style = MaterialTheme.typography.titleLarge) },
+        text = {
+          Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(
+              "Paste your personal Sketchfab API Token (sketchfab.com/settings/password) to enable free 3D downloads right in this APK. Stored locally in DataStore.",
+              style = MaterialTheme.typography.bodySmall,
+            )
+            OutlinedTextField(
+              value = apiKeyDraft,
+              onValueChange = { apiKeyDraft = it },
+              singleLine = true,
+              placeholder = { Text("Paste Sketchfab API Token...") },
+              colors =
+                OutlinedTextFieldDefaults.colors(
+                  focusedBorderColor = RacingOrangeAccent,
+                  unfocusedBorderColor = Color.White.copy(alpha = 0.25f),
+                  focusedTextColor = TextPrimary,
+                  unfocusedTextColor = TextPrimary,
+                ),
+              modifier = Modifier.fillMaxWidth().testTag("sketchfab_api_key_input"),
+            )
+          }
+        },
+        confirmButton = {
+          Button(
+            onClick = {
+              onSaveApiKey(apiKeyDraft)
+              showApiKeyDialog = false
+            },
+            colors = ButtonDefaults.buttonColors(containerColor = RacingOrangeAccent, contentColor = DarkNavyBg),
+            modifier = Modifier.testTag("save_sketchfab_key_button"),
+          ) {
+            Text("SAVE TOKEN")
+          }
+        },
+        dismissButton = {
+          TextButton(onClick = { showApiKeyDialog = false }) {
+            Text("CANCEL", color = TextSecondary)
+          }
+        },
+      )
     }
   }
 }

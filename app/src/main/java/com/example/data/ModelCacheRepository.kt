@@ -47,6 +47,26 @@ data class ModelCacheSnapshot(
 class ModelCacheRepository(private val context: Context) {
 
   private val cacheKey = stringPreferencesKey("cached_3d_models_v1")
+  private val runtimeApiKeyPref = stringPreferencesKey("sketchfab_runtime_api_token_v1")
+
+  val runtimeApiKeyFlow: Flow<String> =
+    context.modelCacheDataStore.data.map { prefs -> prefs[runtimeApiKeyPref].orEmpty().trim() }
+
+  suspend fun getRuntimeApiKey(): String =
+    withContext(Dispatchers.IO) { runtimeApiKeyFlow.first() }
+
+  suspend fun saveRuntimeApiKey(token: String) {
+    withContext(Dispatchers.IO) {
+      val cleaned = token.trim()
+      context.modelCacheDataStore.edit { prefs ->
+        if (cleaned.isBlank()) {
+          prefs.remove(runtimeApiKeyPref)
+        } else {
+          prefs[runtimeApiKeyPref] = cleaned
+        }
+      }
+    }
+  }
 
   val cacheFlow: Flow<ModelCacheSnapshot> =
     context.modelCacheDataStore.data.map { prefs ->

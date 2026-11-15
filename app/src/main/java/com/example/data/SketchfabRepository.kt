@@ -13,10 +13,42 @@ import java.util.concurrent.TimeUnit
 import java.util.zip.ZipInputStream
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
-import okhttp3.Request
+import okhttp3.ResponseBody
 import org.json.JSONObject
+import retrofit2.Response
+import retrofit2.Retrofit
+import retrofit2.http.GET
+import retrofit2.http.Header
+import retrofit2.http.Path
+import retrofit2.http.Query
+import retrofit2.http.Streaming
+import retrofit2.http.Url
+
+private interface SketchfabApiService {
+  @GET("v3/search")
+  suspend fun searchModels(
+    @Query("type") type: String = "models",
+    @Query("downloadable") downloadable: Boolean = true,
+    @Query("archives_flavours") archivesFlavours: Boolean = false,
+    @Query("max_face_count") maxFaceCount: Int = 90_000,
+    @Query("count") count: Int = 18,
+    @Query("q") query: String? = null,
+    @Query("sort_by") sortBy: String? = null,
+    @Query("cursor") cursor: String? = null,
+    @Header("Authorization") authorization: String? = null,
+  ): Response<ResponseBody>
+
+  @GET("v3/models/{uid}/download")
+  suspend fun getModelDownloadInfo(
+    @Path("uid") uid: String,
+    @Header("Authorization") authorization: String,
+  ): Response<ResponseBody>
+
+  @Streaming
+  @GET
+  suspend fun downloadModelArchive(@Url fileUrl: String): Response<ResponseBody>
+}
 
 class SketchfabRepository(private val context: Context) {
 
@@ -45,103 +77,108 @@ class SketchfabRepository(private val context: Context) {
       .writeTimeout(20, TimeUnit.SECONDS)
       .build()
 
+  private val apiService: SketchfabApiService =
+    Retrofit.Builder()
+      .baseUrl("https://api.sketchfab.com/")
+      .client(client)
+      .build()
+      .create(SketchfabApiService::class.java)
+
+  @Volatile private var runtimeApiKeyOverride: String = ""
+
+  fun setRuntimeApiKey(token: String) {
+    runtimeApiKeyOverride = token.trim()
+  }
+
   val apiKey: String
-    get() = BuildConfig.SKETCHFAB_API_KEY
+    get() {
+      val override = runtimeApiKeyOverride.trim()
+      if (override.isNotBlank() && override != "MY_SKETCHFAB_API_KEY") return override
+      val buildCfg = BuildConfig.SKETCHFAB_API_KEY.trim()
+      return if (buildCfg.isNotBlank() && buildCfg != "MY_SKETCHFAB_API_KEY") buildCfg else ""
+    }
 
   val hasValidApiKey: Boolean
-    get() = apiKey.isNotBlank() && apiKey != "MY_SKETCHFAB_API_KEY"
+    get() = apiKey.isNotBlank()
 
   private val modelsRootDir: File
     get() = File(context.filesDir, "sketchfab_models").apply { mkdirs() }
 
   suspend fun searchFreeModels(
     query: String,
-    sortBy: String = "-likeCount",
+    sortBy: String? = null,
     maxFaceCount: Int = 90_000,
     cursor: String? = null,
   ): Result<Pair<List<SketchfabModelSummary>, String?>> =
     withContext(Dispatchers.IO) {
       runCatching {
-        val urlBuilder =
-          "https://api.sketchfab.com/v3/models"
-            .toHttpUrl()
-            .newBuilder()
-            .addQueryParameter("type", "models")
-            .addQueryParameter("downloadable", "true")
-            .addQueryParameter("archives_flavours", "false")
-            .addQueryParameter("sort_by", sortBy)
-            .addQueryParameter("max_face_count", maxFaceCount.toString())
-            .addQueryParameter("count", "18")
+        val cleanedQuery = query.trim().takeIf { it.isNotBlank() }
+        // Omit sort_by when a query is present so Sketchfab v3/search sorts by relevance
+        val effectiveSort = sortBy ?: if (cleanedQuery == null) "-likeCount" else null
+        val authHeader = if (hasValidApiKey) "Token $apiKey" else null
 
-        if (query.isNotBlank()) {
-          urlBuilder.addQueryParameter("q", query.trim())
-        }
-        if (!cursor.isNullOrBlank()) {
-          urlBuilder.addQueryParameter("cursor", cursor)
+        val resp =
+          apiService.searchModels(
+            query = cleanedQuery,
+            sortBy = effectiveSort,
+            maxFaceCount = maxFaceCount,
+            cursor = cursor?.takeIf { it.isNotBlank() },
+            authorization = authHeader,
+          )
+
+        val bodyStr = resp.body()?.string() ?: resp.errorBody()?.string().orEmpty()
+        if (!resp.isSuccessful) {
+          throw IllegalStateException(
+            when (resp.code()) {
+              401 -> "Sketchfab API token rejected (401). Tap KEY badge to update your token."
+              429 -> "Sketchfab rate limit reached (429). Please try again in a moment."
+              else -> "Sketchfab search error (${resp.code()}): ${resp.message()}"
+            }
+          )
         }
 
-        val reqBuilder =
-          Request.Builder()
-            .url(urlBuilder.build())
-            .header("Accept", "application/json")
-        if (hasValidApiKey) {
-          reqBuilder.header("Authorization", "Token $apiKey")
-        }
+        val root = JSONObject(bodyStr)
+        val nextCursor =
+          root.optJSONObject("cursors")?.optString("next", "")?.takeIf { it.isNotBlank() && it != "null" }
+        val resultsArr = root.optJSONArray("results")
+        val items = mutableListOf<SketchfabModelSummary>()
 
-        client.newCall(reqBuilder.build()).execute().use { resp ->
-          val bodyStr = resp.body?.string().orEmpty()
-          if (!resp.isSuccessful) {
-            throw IllegalStateException(
-              when (resp.code) {
-                401 -> "Sketchfab API token rejected (401). Please check SKETCHFAB_API_KEY in Secrets."
-                429 -> "Sketchfab rate limit reached (429). Please try again in a moment."
-                else -> "Sketchfab search error (${resp.code}): ${resp.message}"
-              }
+        if (resultsArr != null) {
+          for (i in 0 until resultsArr.length()) {
+            val item = resultsArr.optJSONObject(i) ?: continue
+            val uid = item.optString("uid", "")
+            if (uid.isBlank()) continue
+
+            val thumbUrl = pickBestThumbnailUrl(item.optJSONObject("thumbnails"))
+            val userObj = item.optJSONObject("user")
+            val authorName =
+              userObj?.optString("displayName")?.takeIf { it.isNotBlank() }
+                ?: userObj?.optString("username")?.takeIf { it.isNotBlank() }
+                ?: "Sketchfab Creator"
+            val authorUrl = userObj?.optString("profileUrl", "") ?: ""
+
+            val licObj = item.optJSONObject("license")
+            val licLabel = licObj?.optString("label", "Creative Commons") ?: "Creative Commons"
+            val licSlug = licObj?.optString("slug", "by") ?: "by"
+
+            items.add(
+              SketchfabModelSummary(
+                uid = uid,
+                name = item.optString("name", "Untitled 3D Model"),
+                authorName = authorName,
+                authorProfileUrl = authorUrl,
+                licenseLabel = licLabel,
+                licenseSlug = licSlug,
+                thumbnailUrl = thumbUrl,
+                faceCount = item.optInt("faceCount", 0),
+                vertexCount = item.optInt("vertexCount", 0),
+                likeCount = item.optInt("likeCount", 0),
+                viewCount = item.optInt("viewCount", 0),
+              )
             )
           }
-
-          val root = JSONObject(bodyStr)
-          val nextCursor = root.optJSONObject("cursors")?.optString("next", "")?.takeIf { it.isNotBlank() && it != "null" }
-          val resultsArr = root.optJSONArray("results")
-          val items = mutableListOf<SketchfabModelSummary>()
-
-          if (resultsArr != null) {
-            for (i in 0 until resultsArr.length()) {
-              val item = resultsArr.optJSONObject(i) ?: continue
-              val uid = item.optString("uid", "")
-              if (uid.isBlank()) continue
-
-              val thumbUrl = pickBestThumbnailUrl(item.optJSONObject("thumbnails"))
-              val userObj = item.optJSONObject("user")
-              val authorName =
-                userObj?.optString("displayName")?.takeIf { it.isNotBlank() }
-                  ?: userObj?.optString("username")?.takeIf { it.isNotBlank() }
-                  ?: "Sketchfab Creator"
-              val authorUrl = userObj?.optString("profileUrl", "") ?: ""
-
-              val licObj = item.optJSONObject("license")
-              val licLabel = licObj?.optString("label", "Creative Commons") ?: "Creative Commons"
-              val licSlug = licObj?.optString("slug", "by") ?: "by"
-
-              items.add(
-                SketchfabModelSummary(
-                  uid = uid,
-                  name = item.optString("name", "Untitled 3D Model"),
-                  authorName = authorName,
-                  authorProfileUrl = authorUrl,
-                  licenseLabel = licLabel,
-                  licenseSlug = licSlug,
-                  thumbnailUrl = thumbUrl,
-                  faceCount = item.optInt("faceCount", 0),
-                  vertexCount = item.optInt("vertexCount", 0),
-                  likeCount = item.optInt("likeCount", 0),
-                  viewCount = item.optInt("viewCount", 0),
-                )
-              )
-            }
-          }
-          items to nextCursor
         }
+        items to nextCursor
       }
     }
 
@@ -150,14 +187,12 @@ class SketchfabRepository(private val context: Context) {
     avoidUids: Set<String> = emptySet(),
   ): Result<SketchfabModelSummary> =
     withContext(Dispatchers.IO) {
-      searchFreeModels(query = query, sortBy = "-likeCount", maxFaceCount = 55_000).mapCatching { (items, _) ->
+      searchFreeModels(query = query, sortBy = null, maxFaceCount = 55_000).mapCatching { (items, _) ->
         val filtered = items.filter { it.uid !in avoidUids }
-        val chosen =
-          filtered.firstOrNull { it.faceCount in 500..45_000 }
-            ?: filtered.firstOrNull()
-            ?: items.firstOrNull()
-            ?: throw IllegalStateException("No free downloadable 3D model found for \"$query\".")
-        chosen
+        filtered.firstOrNull { it.faceCount in 500..45_000 }
+          ?: filtered.firstOrNull()
+          ?: items.firstOrNull()
+          ?: throw IllegalStateException("No free downloadable 3D model found for \"$query\".")
       }
     }
 
@@ -169,52 +204,43 @@ class SketchfabRepository(private val context: Context) {
       runCatching {
         if (!hasValidApiKey) {
           throw IllegalStateException(
-            "SKETCHFAB_API_KEY missing. Add it to AI Studio Secrets and rebuild the app."
+            "SKETCHFAB_API_KEY missing. Tap 'KEY MISSING' above to enter your token, or add SKETCHFAB_API_KEY to GitHub/AI Studio Secrets."
           )
         }
 
         onProgress(0.04f)
-        val infoReq =
-          Request.Builder()
-            .url("https://api.sketchfab.com/v3/models/${summary.uid}/download")
-            .header("Authorization", "Token $apiKey")
-            .header("Accept", "application/json")
-            .build()
-
-        var downloadUrl: String? = null
-        var isSingleGlb = false
-        var expectedSize = 0L
-
-        client.newCall(infoReq).execute().use { resp ->
-          val bodyStr = resp.body?.string().orEmpty()
-          if (!resp.isSuccessful) {
-            throw IllegalStateException(
-              when (resp.code) {
-                401 -> "Invalid SKETCHFAB_API_KEY (401). Please update your Sketchfab API token in Secrets."
-                403 -> "This model is restricted or requires creator permission (403)."
-                404 -> "Download package not available for this model (404)."
-                429 -> "Sketchfab download quota/rate limit reached (429)."
-                else -> "Sketchfab download endpoint failed (${resp.code})."
-              }
-            )
-          }
-
-          val root = JSONObject(bodyStr)
-          val glbObj = root.optJSONObject("glb")
-          val gltfObj = root.optJSONObject("gltf")
-          when {
-            glbObj != null && glbObj.optString("url").isNotBlank() -> {
-              downloadUrl = glbObj.optString("url")
-              expectedSize = glbObj.optLong("size", 0L)
-              isSingleGlb = true
+        val infoResp = apiService.getModelDownloadInfo(uid = summary.uid, authorization = "Token $apiKey")
+        val infoBody = infoResp.body()?.string() ?: infoResp.errorBody()?.string().orEmpty()
+        if (!infoResp.isSuccessful) {
+          throw IllegalStateException(
+            when (infoResp.code()) {
+              401 -> "Invalid SKETCHFAB_API_KEY (401). Tap 'KEY' badge above to paste a valid token."
+              403 -> "This model is restricted or requires creator permission (403)."
+              404 -> "Download package not available for this model (404)."
+              429 -> "Sketchfab download quota/rate limit reached (429)."
+              else -> "Sketchfab download endpoint failed (${infoResp.code()})."
             }
-            gltfObj != null && gltfObj.optString("url").isNotBlank() -> {
-              downloadUrl = gltfObj.optString("url")
-              expectedSize = gltfObj.optLong("size", 0L)
-              isSingleGlb = false
-            }
-            else -> throw IllegalStateException("No glTF or GLB download format available for ${summary.name}.")
+          )
+        }
+
+        val root = JSONObject(infoBody)
+        val glbObj = root.optJSONObject("glb")
+        val gltfObj = root.optJSONObject("gltf")
+        val downloadUrl: String
+        val expectedSize: Long
+        val isSingleGlb: Boolean
+        when {
+          glbObj != null && glbObj.optString("url").isNotBlank() -> {
+            downloadUrl = glbObj.optString("url")
+            expectedSize = glbObj.optLong("size", 0L)
+            isSingleGlb = true
           }
+          gltfObj != null && gltfObj.optString("url").isNotBlank() -> {
+            downloadUrl = gltfObj.optString("url")
+            expectedSize = gltfObj.optLong("size", 0L)
+            isSingleGlb = false
+          }
+          else -> throw IllegalStateException("No glTF or GLB download format available for ${summary.name}.")
         }
 
         if (expectedSize > 75L * 1024L * 1024L) {
@@ -223,7 +249,6 @@ class SketchfabRepository(private val context: Context) {
           )
         }
 
-        val targetUrl = downloadUrl!!
         val modelDir = File(modelsRootDir, summary.uid)
         if (modelDir.exists()) modelDir.deleteRecursively()
         modelDir.mkdirs()
@@ -231,16 +256,15 @@ class SketchfabRepository(private val context: Context) {
         val tempFile = File(context.cacheDir, "sf_${summary.uid}.tmp")
         if (tempFile.exists()) tempFile.delete()
 
-        val assetReq = Request.Builder().url(targetUrl).build()
         var downloadedBytes = 0L
-        client.newCall(assetReq).execute().use { assetResp ->
-          if (!assetResp.isSuccessful) {
-            throw IllegalStateException("CDN download failed (${assetResp.code}).")
-          }
-          val body = assetResp.body ?: throw IllegalStateException("Empty download stream.")
-          val contentLen = body.contentLength().takeIf { it > 0L } ?: expectedSize.coerceAtLeast(1L)
-
-          body.byteStream().use { input ->
+        val assetResp = apiService.downloadModelArchive(downloadUrl)
+        if (!assetResp.isSuccessful) {
+          throw IllegalStateException("CDN download failed (${assetResp.code()}).")
+        }
+        val body = assetResp.body() ?: throw IllegalStateException("Empty download stream.")
+        body.use { responseBody ->
+          val contentLen = responseBody.contentLength().takeIf { it > 0L } ?: expectedSize.coerceAtLeast(1L)
+          responseBody.byteStream().use { input ->
             FileOutputStream(tempFile).use { output ->
               val buf = ByteArray(16 * 1024)
               var read: Int

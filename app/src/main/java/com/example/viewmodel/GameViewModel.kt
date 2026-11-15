@@ -72,6 +72,12 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
 
   init {
     viewModelScope.launch {
+      val savedToken = modelCacheRepo.getRuntimeApiKey()
+      if (savedToken.isNotBlank()) {
+        sketchfabRepo.setRuntimeApiKey(savedToken)
+      }
+      _sketchfabState.update { it.copy(hasValidApiKey = sketchfabRepo.hasValidApiKey) }
+
       val loaded = saveRepo.loadOnce()
       modelCacheRepo.seedIfEmpty(loaded.downloaded3dModels, loaded.equipped3dModelByVehicle)
       val verifiedCache = modelCacheRepo.loadAndVerifyCache()
@@ -561,7 +567,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
       _sketchfabState.update {
         it.copy(
           downloadError =
-            "SKETCHFAB_API_KEY not found in BuildConfig. Ensure Secrets name is SKETCHFAB_API_KEY and rebuild."
+            "SKETCHFAB_API_KEY missing. Tap 'KEY MISSING' above to paste your Sketchfab token in-app, or add it in GitHub/AI Studio Secrets."
         )
       }
       return
@@ -712,6 +718,24 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
     viewModelScope.launch {
       modelCacheRepo.clearAllCache()
       _sketchfabState.update { it.copy(batchStatusMessage = "Cleared all local 3D model cache.") }
+    }
+  }
+
+  fun saveRuntimeSketchfabKey(token: String) {
+    soundEngine.playClick()
+    val cleaned = token.trim()
+    sketchfabRepo.setRuntimeApiKey(cleaned)
+    viewModelScope.launch {
+      modelCacheRepo.saveRuntimeApiKey(cleaned)
+      _sketchfabState.update {
+        it.copy(
+          hasValidApiKey = sketchfabRepo.hasValidApiKey,
+          downloadError = null,
+          batchStatusMessage =
+            if (sketchfabRepo.hasValidApiKey) "Sketchfab API token saved! You can now download 3D models."
+            else "Custom Sketchfab token cleared.",
+        )
+      }
     }
   }
 

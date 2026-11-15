@@ -99,4 +99,22 @@ class ModelCacheRepositoryTest {
       assertTrue(q!!.isNotBlank())
     }
   }
+
+  @Test
+  fun savesAndReadsRuntimeSketchfabApiKeyInDataStore() = runTest {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val cacheRepo = ModelCacheRepository(context)
+    val sketchfabRepo = SketchfabRepository(context)
+
+    cacheRepo.saveRuntimeApiKey("  sf_test_token_9988  ")
+    val loaded = cacheRepo.getRuntimeApiKey()
+    assertEquals("sf_test_token_9988", loaded)
+
+    sketchfabRepo.setRuntimeApiKey(loaded)
+    assertTrue(sketchfabRepo.hasValidApiKey)
+    assertEquals("sf_test_token_9988", sketchfabRepo.apiKey)
+
+    cacheRepo.saveRuntimeApiKey("")
+    assertEquals("", cacheRepo.getRuntimeApiKey())
+  }
 }
