@@ -1,0 +1,6 @@
+{
+  "name": "Hill Rush India",
+  "description": "2D physics-based hill climbing racing game featuring 12 unique vehicles, 12 Indian and global terrains, 8 upgrade systems, stunts, missions, daily rewards, and persistent progression.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
