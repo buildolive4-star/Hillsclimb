@@ -4,6 +4,7 @@ import android.content.Context
 import com.example.BuildConfig
 import com.example.model.Downloaded3DModel
 import com.example.model.SketchfabModelSummary
+import com.example.model.VehicleId
 import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileInputStream
@@ -18,6 +19,24 @@ import okhttp3.Request
 import org.json.JSONObject
 
 class SketchfabRepository(private val context: Context) {
+
+  companion object {
+    val VEHICLE_SEARCH_QUERIES: Map<VehicleId, String> =
+      mapOf(
+        VehicleId.MINI_JEEP to "offroad jeep 4x4 lowpoly",
+        VehicleId.HILL_BIKE to "dirt bike motocross lowpoly",
+        VehicleId.MONSTER_TRUCK to "monster truck 3d",
+        VehicleId.SPORTS_CAR to "sports car coupe lowpoly",
+        VehicleId.TRACTOR to "farm tractor lowpoly",
+        VehicleId.SCHOOL_BUS to "school bus cartoon",
+        VehicleId.PICKUP_TRUCK to "pickup truck 4x4 lowpoly",
+        VehicleId.RALLY_CAR to "rally car lowpoly",
+        VehicleId.ARMY_JEEP to "military jeep willys",
+        VehicleId.ELECTRIC_CAR to "futuristic electric car lowpoly",
+        VehicleId.SNOW_VEHICLE to "snowmobile tracked vehicle",
+        VehicleId.HEAVY_TRUCK to "heavy cargo truck lowpoly",
+      )
+  }
 
   private val client =
     OkHttpClient.Builder()
@@ -123,6 +142,22 @@ class SketchfabRepository(private val context: Context) {
           }
           items to nextCursor
         }
+      }
+    }
+
+  suspend fun fetchBestFreeModelForQuery(
+    query: String,
+    avoidUids: Set<String> = emptySet(),
+  ): Result<SketchfabModelSummary> =
+    withContext(Dispatchers.IO) {
+      searchFreeModels(query = query, sortBy = "-likeCount", maxFaceCount = 55_000).mapCatching { (items, _) ->
+        val filtered = items.filter { it.uid !in avoidUids }
+        val chosen =
+          filtered.firstOrNull { it.faceCount in 500..45_000 }
+            ?: filtered.firstOrNull()
+            ?: items.firstOrNull()
+            ?: throw IllegalStateException("No free downloadable 3D model found for \"$query\".")
+        chosen
       }
     }
 

@@ -5,9 +5,11 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.audio.SoundEngine
 import com.example.data.GameCatalog
+import com.example.data.ModelCacheRepository
 import com.example.data.SaveRepository
 import com.example.data.SketchfabRepository
 import com.example.model.*
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -24,6 +26,11 @@ data class SketchfabUiState(
   val downloadProgress: Float = 0f,
   val downloadError: String? = null,
   val hasValidApiKey: Boolean = false,
+  val isBatchSyncing: Boolean = false,
+  val batchCompletedCount: Int = 0,
+  val batchTotalCount: Int = 12,
+  val batchCurrentVehicleName: String = "",
+  val batchStatusMessage: String? = null,
 )
 
 data class RunSummary(
@@ -48,8 +55,10 @@ data class RunSummary(
 class GameViewModel(application: Application) : AndroidViewModel(application) {
 
   private val saveRepo = SaveRepository(application)
+  private val modelCacheRepo = ModelCacheRepository(application)
   private val sketchfabRepo = SketchfabRepository(application)
   val soundEngine = SoundEngine(application)
+  private var batchSyncJob: Job? = null
 
   private val _saveState = MutableStateFlow(PlayerSaveData())
   val saveState: StateFlow<PlayerSaveData> = _saveState.asStateFlow()
@@ -64,7 +73,13 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
   init {
     viewModelScope.launch {
       val loaded = saveRepo.loadOnce()
-      val normalized = checkDailyMissionReset(loaded)
+      modelCacheRepo.seedIfEmpty(loaded.downloaded3dModels, loaded.equipped3dModelByVehicle)
+      val verifiedCache = modelCacheRepo.loadAndVerifyCache()
+      val normalized =
+        checkDailyMissionReset(loaded).copy(
+          downloaded3dModels = verifiedCache.modelsByUid,
+          equipped3dModelByVehicle = verifiedCache.vehicleToUid,
+        )
       _saveState.value = normalized
       soundEngine.updateSettings(
         music = normalized.settings.musicEnabled,
@@ -76,6 +91,18 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
       _isLoaded.value = true
       if (normalized != loaded) {
         saveRepo.save(normalized)
+      }
+
+      // Observe DataStore 3D Model Cache updates cleanly
+      launch {
+        modelCacheRepo.cacheFlow.collect { snap ->
+          _saveState.update { cur ->
+            cur.copy(
+              downloaded3dModels = snap.modelsByUid,
+              equipped3dModelByVehicle = snap.vehicleToUid,
+            )
+          }
+        }
       }
     }
   }
@@ -478,11 +505,30 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
     summary: SketchfabModelSummary,
     equipToVehicleId: VehicleId?,
   ) {
-    if (_sketchfabState.value.downloadingUid != null) return
-    _sketchfabState.update {
-      it.copy(downloadingUid = summary.uid, downloadProgress = 0.02f, downloadError = null)
-    }
+    if (_sketchfabState.value.downloadingUid != null || _sketchfabState.value.isBatchSyncing) return
     viewModelScope.launch {
+      // Check DataStore cache first to avoid re-downloading existing models
+      val cached = modelCacheRepo.getCachedModel(summary.uid)
+      if (cached != null) {
+        modelCacheRepo.touchLastUsed(cached.uid)
+        if (equipToVehicleId != null) {
+          modelCacheRepo.assignModelToVehicle(equipToVehicleId, cached.uid)
+        }
+        soundEngine.playClick()
+        _sketchfabState.update {
+          it.copy(
+            downloadingUid = null,
+            downloadProgress = 1f,
+            downloadError = null,
+            batchStatusMessage = "Loaded ${cached.name} directly from offline DataStore cache.",
+          )
+        }
+        return@launch
+      }
+
+      _sketchfabState.update {
+        it.copy(downloadingUid = summary.uid, downloadProgress = 0.02f, downloadError = null)
+      }
       val res =
         sketchfabRepo.downloadAndExtractModel(summary) { prog ->
           _sketchfabState.update { it.copy(downloadProgress = prog) }
@@ -490,17 +536,8 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
       res.fold(
         onSuccess = { downloaded ->
           soundEngine.playUpgrade()
-          persistUpdate { data ->
-            val updatedModels = data.downloaded3dModels + (downloaded.uid to downloaded)
-            val updatedEq =
-              if (equipToVehicleId != null) data.equipped3dModelByVehicle + (equipToVehicleId to downloaded.uid)
-              else data.equipped3dModelByVehicle
-            data.copy(
-              downloaded3dModels = updatedModels,
-              equipped3dModelByVehicle = updatedEq,
-              prefer3dShowroom = true,
-            )
-          }
+          modelCacheRepo.putCachedModel(downloaded, assignToVehicle = equipToVehicleId)
+          persistUpdate { it.copy(prefer3dShowroom = true) }
           _sketchfabState.update {
             it.copy(downloadingUid = null, downloadProgress = 1f, downloadError = null)
           }
@@ -518,23 +555,163 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
     }
   }
 
+  fun syncAllVehicleModelsFromSketchfab() {
+    if (_sketchfabState.value.isBatchSyncing || _sketchfabState.value.downloadingUid != null) return
+    if (!sketchfabRepo.hasValidApiKey) {
+      _sketchfabState.update {
+        it.copy(
+          downloadError =
+            "SKETCHFAB_API_KEY not found in BuildConfig. Ensure Secrets name is SKETCHFAB_API_KEY and rebuild."
+        )
+      }
+      return
+    }
+
+    batchSyncJob?.cancel()
+    batchSyncJob =
+      viewModelScope.launch {
+        val allVehicles = GameCatalog.vehicles
+        _sketchfabState.update {
+          it.copy(
+            isBatchSyncing = true,
+            batchCompletedCount = 0,
+            batchTotalCount = allVehicles.size,
+            batchCurrentVehicleName = "",
+            batchStatusMessage = "Checking DataStore 3D cache...",
+            downloadError = null,
+          )
+        }
+
+        val usedUids = modelCacheRepo.loadAndVerifyCache().modelsByUid.keys.toMutableSet()
+        var syncedCount = 0
+
+        for ((index, vehicle) in allVehicles.withIndex()) {
+          val alreadyCached = modelCacheRepo.getCachedModelForVehicle(vehicle.id)
+          if (alreadyCached != null) {
+            syncedCount++
+            _sketchfabState.update {
+              it.copy(
+                batchCompletedCount = index + 1,
+                batchCurrentVehicleName = vehicle.name,
+                batchStatusMessage = "Cached (${index + 1}/${allVehicles.size}): ${vehicle.name} already offline",
+              )
+            }
+            continue
+          }
+
+          val query = SketchfabRepository.VEHICLE_SEARCH_QUERIES[vehicle.id] ?: vehicle.name
+          _sketchfabState.update {
+            it.copy(
+              batchCompletedCount = index,
+              batchCurrentVehicleName = vehicle.name,
+              downloadProgress = 0.05f,
+              batchStatusMessage = "Finding free 3D ${vehicle.name} on Sketchfab...",
+            )
+          }
+
+          val pickRes = sketchfabRepo.fetchBestFreeModelForQuery(query, avoidUids = usedUids)
+          val picked = pickRes.getOrNull()
+          if (picked == null) {
+            _sketchfabState.update {
+              it.copy(
+                batchCompletedCount = index + 1,
+                batchStatusMessage = "Skipped ${vehicle.name}: ${pickRes.exceptionOrNull()?.message ?: "no match"}",
+              )
+            }
+            continue
+          }
+
+          // Double check cache by UID in case this model UID is already stored locally
+          val existingByUid = modelCacheRepo.getCachedModel(picked.uid)
+          if (existingByUid != null) {
+            modelCacheRepo.assignModelToVehicle(vehicle.id, existingByUid.uid)
+            usedUids.add(existingByUid.uid)
+            syncedCount++
+            _sketchfabState.update {
+              it.copy(
+                batchCompletedCount = index + 1,
+                batchStatusMessage = "Linked cached 3D rig for ${vehicle.name}",
+              )
+            }
+            continue
+          }
+
+          _sketchfabState.update {
+            it.copy(
+              downloadingUid = picked.uid,
+              batchStatusMessage = "Downloading ${vehicle.name} (${picked.name})...",
+            )
+          }
+
+          val dlRes =
+            sketchfabRepo.downloadAndExtractModel(picked) { prog ->
+              _sketchfabState.update { it.copy(downloadProgress = prog) }
+            }
+          dlRes.onSuccess { downloaded ->
+            modelCacheRepo.putCachedModel(downloaded, assignToVehicle = vehicle.id)
+            usedUids.add(downloaded.uid)
+            syncedCount++
+          }.onFailure { err ->
+            _sketchfabState.update {
+              it.copy(batchStatusMessage = "Failed ${vehicle.name}: ${err.message}")
+            }
+          }
+
+          _sketchfabState.update {
+            it.copy(
+              downloadingUid = null,
+              batchCompletedCount = index + 1,
+            )
+          }
+        }
+
+        soundEngine.playStunt()
+        persistUpdate { it.copy(prefer3dShowroom = true) }
+        _sketchfabState.update {
+          it.copy(
+            isBatchSyncing = false,
+            downloadingUid = null,
+            downloadProgress = 1f,
+            batchStatusMessage = "Ready! $syncedCount / ${allVehicles.size} vehicles cached offline in DataStore.",
+          )
+        }
+      }
+  }
+
+  fun cancelBatchSync() {
+    batchSyncJob?.cancel()
+    batchSyncJob = null
+    _sketchfabState.update {
+      it.copy(
+        isBatchSyncing = false,
+        downloadingUid = null,
+        downloadProgress = 0f,
+        batchStatusMessage = "Batch sync paused. Already downloaded rigs remain cached.",
+      )
+    }
+  }
+
   fun equip3dModelToVehicle(vehicleId: VehicleId, uid: String?) {
     soundEngine.playClick()
-    persistUpdate { data ->
-      val next = data.equipped3dModelByVehicle.toMutableMap()
-      if (uid == null) next.remove(vehicleId) else if (uid in data.downloaded3dModels) next[vehicleId] = uid
-      data.copy(equipped3dModelByVehicle = next, prefer3dShowroom = true)
+    viewModelScope.launch {
+      if (uid != null) modelCacheRepo.touchLastUsed(uid)
+      modelCacheRepo.assignModelToVehicle(vehicleId, uid)
+      persistUpdate { it.copy(prefer3dShowroom = true) }
     }
   }
 
   fun deleteDownloaded3dModel(uid: String) {
-    val existing = _saveState.value.downloaded3dModels[uid] ?: return
-    sketchfabRepo.deleteLocalFiles(existing)
     soundEngine.playClick()
-    persistUpdate { data ->
-      val nextModels = data.downloaded3dModels - uid
-      val nextEq = data.equipped3dModelByVehicle.filterValues { it != uid }
-      data.copy(downloaded3dModels = nextModels, equipped3dModelByVehicle = nextEq)
+    viewModelScope.launch {
+      modelCacheRepo.removeCachedModel(uid)
+    }
+  }
+
+  fun clearAll3dModelCache() {
+    soundEngine.playClick()
+    viewModelScope.launch {
+      modelCacheRepo.clearAllCache()
+      _sketchfabState.update { it.copy(batchStatusMessage = "Cleared all local 3D model cache.") }
     }
   }
 
@@ -544,13 +721,14 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
   }
 
   fun clearSketchfabDownloadError() {
-    _sketchfabState.update { it.copy(downloadError = null) }
+    _sketchfabState.update { it.copy(downloadError = null, batchStatusMessage = null) }
   }
 
   fun resetAllProgress() {
     soundEngine.playClick()
-    _saveState.value.downloaded3dModels.values.forEach { sketchfabRepo.deleteLocalFiles(it) }
+    batchSyncJob?.cancel()
     viewModelScope.launch {
+      modelCacheRepo.clearAllCache()
       val fresh = saveRepo.resetProgress()
       _saveState.value = fresh
       soundEngine.updateSettings(
@@ -565,6 +743,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
 
   override fun onCleared() {
     super.onCleared()
+    batchSyncJob?.cancel()
     soundEngine.release()
   }
 }

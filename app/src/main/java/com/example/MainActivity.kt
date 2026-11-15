@@ -336,6 +336,9 @@ fun HillRushApp(viewModel: GameViewModel) {
         onDownloadAndEquip = viewModel::downloadAndEquipSketchfabModel,
         onEquipDownloadedToVehicle = viewModel::equip3dModelToVehicle,
         onDeleteDownloaded = viewModel::deleteDownloaded3dModel,
+        onSyncAllVehicles = viewModel::syncAllVehicleModelsFromSketchfab,
+        onCancelBatchSync = viewModel::cancelBatchSync,
+        onClearAllCache = viewModel::clearAll3dModelCache,
         onClearError = viewModel::clearSketchfabDownloadError,
         onBack = {
           viewModel.soundEngine.playClick()

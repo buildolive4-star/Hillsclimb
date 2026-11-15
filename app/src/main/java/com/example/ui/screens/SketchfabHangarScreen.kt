@@ -53,6 +53,9 @@ fun SketchfabHangarScreen(
   onDownloadAndEquip: (SketchfabModelSummary, VehicleId?) -> Unit,
   onEquipDownloadedToVehicle: (VehicleId, String?) -> Unit,
   onDeleteDownloaded: (String) -> Unit,
+  onSyncAllVehicles: () -> Unit,
+  onCancelBatchSync: () -> Unit,
+  onClearAllCache: () -> Unit,
   onClearError: () -> Unit,
   onBack: () -> Unit,
 ) {
@@ -117,6 +120,42 @@ fun SketchfabHangarScreen(
           verticalAlignment = Alignment.CenterVertically,
           horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
+          val totalCacheBytes =
+            remember(saveData.downloaded3dModels) {
+              saveData.downloaded3dModels.values.sumOf { it.sizeBytes }
+            }
+          val mappedCount = saveData.equipped3dModelByVehicle.size
+
+          Surface(
+            shape = RoundedCornerShape(12.dp),
+            color = CardNavy,
+            border = BorderStroke(1.dp, SkyCyan.copy(alpha = 0.4f)),
+          ) {
+            Text(
+              text = "$mappedCount/12 CACHED • ${formatFileSizeMb(totalCacheBytes)}",
+              style = MaterialTheme.typography.labelSmall,
+              color = SkyCyan,
+              modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+            )
+          }
+
+          ArcadeGradientButton(
+            text =
+              if (sketchfabState.isBatchSyncing)
+                "STOP (${sketchfabState.batchCompletedCount}/${sketchfabState.batchTotalCount})"
+              else "SYNC ALL 12",
+            icon = if (sketchfabState.isBatchSyncing) Icons.Filled.Stop else Icons.Filled.CloudSync,
+            colors =
+              if (sketchfabState.isBatchSyncing) listOf(DangerRed, RacingOrangeAccent)
+              else listOf(RacingOrangeAccent, GoldenYellowHighlight),
+            textColor = if (sketchfabState.isBatchSyncing) TextPrimary else DarkNavyBg,
+            onClick = {
+              if (sketchfabState.isBatchSyncing) onCancelBatchSync() else onSyncAllVehicles()
+            },
+            modifier = Modifier.height(42.dp),
+            testTag = "sketchfab_sync_all_button",
+          )
+
           Surface(
             shape = RoundedCornerShape(12.dp),
             color = if (sketchfabState.hasValidApiKey) EmeraldDark.copy(alpha = 0.65f) else Color(0xFF451A03),
@@ -138,9 +177,57 @@ fun SketchfabHangarScreen(
                 modifier = Modifier.size(16.dp),
               )
               Text(
-                text = if (sketchfabState.hasValidApiKey) "SKETCHFAB API ACTIVE" else "KEY NOT FOUND",
+                text = if (sketchfabState.hasValidApiKey) "API ACTIVE" else "KEY MISSING",
                 style = MaterialTheme.typography.labelSmall,
                 color = if (sketchfabState.hasValidApiKey) SuccessGreen else GoldenYellowHighlight,
+              )
+            }
+          }
+        }
+      }
+
+      if (sketchfabState.isBatchSyncing || sketchfabState.batchStatusMessage != null) {
+        Surface(
+          shape = RoundedCornerShape(12.dp),
+          color = CardNavyElevated,
+          border = BorderStroke(1.dp, ElectricBlueSecondary.copy(alpha = 0.55f)),
+          modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
+        ) {
+          Column(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+          ) {
+            Row(
+              modifier = Modifier.fillMaxWidth(),
+              horizontalArrangement = Arrangement.SpaceBetween,
+              verticalAlignment = Alignment.CenterVertically,
+            ) {
+              Text(
+                text = sketchfabState.batchStatusMessage.orEmpty(),
+                style = MaterialTheme.typography.labelMedium,
+                color = GoldenYellowHighlight,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+              )
+              if (!sketchfabState.isBatchSyncing) {
+                Text(
+                  text = "DISMISS",
+                  style = MaterialTheme.typography.labelSmall,
+                  color = SkyCyan,
+                  modifier = Modifier.clickable { onClearError() },
+                )
+              }
+            }
+            if (sketchfabState.isBatchSyncing) {
+              LinearProgressIndicator(
+                progress = {
+                  (sketchfabState.batchCompletedCount.toFloat() / sketchfabState.batchTotalCount.coerceAtLeast(1))
+                    .coerceIn(0.05f, 1f)
+                },
+                color = SuccessGreen,
+                trackColor = MidnightBluePrimary,
+                modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(50)),
               )
             }
           }
@@ -355,48 +442,74 @@ fun SketchfabHangarScreen(
                 }
               }
             } else {
-              LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(downloadedList, key = { it.uid }) { dl ->
-                  val equippedTo = saveData.equipped3dModelByVehicle.entries.filter { it.value == dl.uid }.map { it.key }
-                  val selected = activeDownloaded?.uid == dl.uid
+              Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxSize()) {
+                Row(
+                  modifier = Modifier.fillMaxWidth(),
+                  horizontalArrangement = Arrangement.SpaceBetween,
+                  verticalAlignment = Alignment.CenterVertically,
+                ) {
+                  Text(
+                    text = "DATASTORE OFFLINE 3D CACHE",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = SkyCyan,
+                  )
                   Surface(
-                    shape = RoundedCornerShape(16.dp),
-                    color = if (selected) CardNavyElevated else CardNavy,
-                    border = BorderStroke(if (selected) 2.dp else 1.dp, if (selected) RacingOrangeAccent else SuccessGreen.copy(alpha = 0.5f)),
-                    modifier =
-                      Modifier.fillMaxWidth().clickable {
-                        selectedDownloadedUid = dl.uid
-                        selectedSummary = null
-                      },
+                    shape = RoundedCornerShape(10.dp),
+                    color = DangerRed.copy(alpha = 0.18f),
+                    border = BorderStroke(1.dp, DangerRed.copy(alpha = 0.6f)),
+                    modifier = Modifier.clickable { onClearAllCache() }.testTag("clear_3d_cache_button"),
                   ) {
-                    Row(
-                      modifier = Modifier.padding(10.dp),
-                      verticalAlignment = Alignment.CenterVertically,
-                      horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    Text(
+                      text = "CLEAR ALL CACHE",
+                      style = MaterialTheme.typography.labelSmall,
+                      color = DangerRed,
+                      modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                    )
+                  }
+                }
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.weight(1f)) {
+                  items(downloadedList, key = { it.uid }) { dl ->
+                    val equippedTo = saveData.equipped3dModelByVehicle.entries.filter { it.value == dl.uid }.map { it.key }
+                    val selected = activeDownloaded?.uid == dl.uid
+                    Surface(
+                      shape = RoundedCornerShape(16.dp),
+                      color = if (selected) CardNavyElevated else CardNavy,
+                      border = BorderStroke(if (selected) 2.dp else 1.dp, if (selected) RacingOrangeAccent else SuccessGreen.copy(alpha = 0.5f)),
+                      modifier =
+                        Modifier.fillMaxWidth().clickable {
+                          selectedDownloadedUid = dl.uid
+                          selectedSummary = null
+                        },
                     ) {
-                      AsyncImage(
-                        model = dl.thumbnailUrl,
-                        contentDescription = dl.name,
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier.size(64.dp).clip(RoundedCornerShape(12.dp)),
-                      )
-                      Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        Text(dl.name, style = MaterialTheme.typography.titleMedium, color = TextPrimary, maxLines = 1)
-                        Text(
-                          "By ${dl.authorName} • ${dl.licenseLabel} • ${formatFileSizeMb(dl.sizeBytes)}",
-                          style = MaterialTheme.typography.labelSmall,
-                          color = TextSecondary,
+                      Row(
+                        modifier = Modifier.padding(10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                      ) {
+                        AsyncImage(
+                          model = dl.thumbnailUrl,
+                          contentDescription = dl.name,
+                          contentScale = ContentScale.Crop,
+                          modifier = Modifier.size(64.dp).clip(RoundedCornerShape(12.dp)),
                         )
-                        if (equippedTo.isNotEmpty()) {
+                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                          Text(dl.name, style = MaterialTheme.typography.titleMedium, color = TextPrimary, maxLines = 1)
                           Text(
-                            text = "EQUIPPED ON: ${equippedTo.joinToString { GameCatalog.vehicleById(it).name }}",
+                            "By ${dl.authorName} • ${dl.licenseLabel} • ${formatFileSizeMb(dl.sizeBytes)}",
                             style = MaterialTheme.typography.labelSmall,
-                            color = SuccessGreen,
+                            color = TextSecondary,
                           )
+                          if (equippedTo.isNotEmpty()) {
+                            Text(
+                              text = "EQUIPPED ON: ${equippedTo.joinToString { GameCatalog.vehicleById(it).name }}",
+                              style = MaterialTheme.typography.labelSmall,
+                              color = SuccessGreen,
+                            )
+                          }
                         }
-                      }
-                      IconButton(onClick = { onDeleteDownloaded(dl.uid) }) {
-                        Icon(Icons.Filled.DeleteOutline, contentDescription = "Delete 3D model", tint = DangerRed)
+                        IconButton(onClick = { onDeleteDownloaded(dl.uid) }) {
+                          Icon(Icons.Filled.DeleteOutline, contentDescription = "Delete 3D model", tint = DangerRed)
+                        }
                       }
                     }
                   }
